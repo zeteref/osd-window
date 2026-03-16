@@ -1,0 +1,14 @@
+[package]
+name = "osd-window"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pangocairo = "0.20"
+anyhow = "1"
+libc = "0.2"
+wayrs-client = "1.0"
+wayrs-protocols = { version = "0.14", features = ["wlr-layer-shell-unstable-v1"] }
+wayrs-utils = { version = "0.17", features = ["shm_alloc", "seats", "keyboard"] }
+clap = { version = "4.3", features = ["derive"] }
+
