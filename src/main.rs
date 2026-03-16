@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
         wl_surface,
         None,
         zwlr_layer_shell_v1::Layer::Overlay,
-        CString::new("hello-world").unwrap(),
+        CString::new("osd-window").unwrap(),
         layer_surface_cb,
     );
 
@@ -77,15 +77,14 @@ fn main() -> anyhow::Result<()> {
 
     wl_surface.commit(&mut conn);
 
-
     let mut state = State {
         shm_alloc,
         seats,
         keyboards: Vec::new(),
         wl_surface,
         layer_surface,
-        width: 0,        // Will be set by Configure event (actual screen size)
-        height: 0,       // Will be set by Configure event
+        width: 0,  // Will be set by Configure event (actual screen size)
+        height: 0, // Will be set by Configure event
         target_width: args.width,
         target_height: args.height,
         markup: input.to_string(),
@@ -118,10 +117,10 @@ struct State {
     keyboards: Vec<Keyboard>,
     wl_surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
-    width: u32,          // Screen width
-    height: u32,         // Screen height
-    target_width: u32,   // Box width
-    target_height: u32,  // Box height
+    width: u32,         // Screen width
+    height: u32,        // Screen height
+    target_width: u32,  // Box width
+    target_height: u32, // Box height
     markup: String,
     opacity: f64,
     fullscreen: bool,
@@ -165,7 +164,7 @@ impl State {
         };
 
         let cairo_ctx = cairo::Context::new(&cairo_surf).expect("cairo context");
-        
+
         // Clear background to transparent
         cairo_ctx.set_operator(cairo::Operator::Source);
         cairo_ctx.set_source_rgba(0.0, 0.0, 0.0, 0.0);
@@ -179,17 +178,41 @@ impl State {
 
         let radius = if self.fullscreen { 0.0 } else { 15.0 };
         let border_width = if self.fullscreen { 0.0 } else { 3.0 };
-        
+
         cairo_ctx.new_sub_path();
-        cairo_ctx.arc(radius, radius, radius, 180.0 * (std::f64::consts::PI / 180.0), 270.0 * (std::f64::consts::PI / 180.0));
-        cairo_ctx.arc(box_width as f64 - radius, radius, radius, 270.0 * (std::f64::consts::PI / 180.0), 360.0 * (std::f64::consts::PI / 180.0));
-        cairo_ctx.arc(box_width as f64 - radius, box_height as f64 - radius, radius, 0.0, 90.0 * (std::f64::consts::PI / 180.0));
-        cairo_ctx.arc(radius, box_height as f64 - radius, radius, 90.0 * (std::f64::consts::PI / 180.0), 180.0 * (std::f64::consts::PI / 180.0));
+        cairo_ctx.arc(
+            radius,
+            radius,
+            radius,
+            180.0 * (std::f64::consts::PI / 180.0),
+            270.0 * (std::f64::consts::PI / 180.0),
+        );
+        cairo_ctx.arc(
+            box_width as f64 - radius,
+            radius,
+            radius,
+            270.0 * (std::f64::consts::PI / 180.0),
+            360.0 * (std::f64::consts::PI / 180.0),
+        );
+        cairo_ctx.arc(
+            box_width as f64 - radius,
+            box_height as f64 - radius,
+            radius,
+            0.0,
+            90.0 * (std::f64::consts::PI / 180.0),
+        );
+        cairo_ctx.arc(
+            radius,
+            box_height as f64 - radius,
+            radius,
+            90.0 * (std::f64::consts::PI / 180.0),
+            180.0 * (std::f64::consts::PI / 180.0),
+        );
         cairo_ctx.close_path();
 
         cairo_ctx.set_source_rgba(0.05, 0.05, 0.05, self.opacity);
         cairo_ctx.fill_preserve().unwrap();
-        
+
         if !self.fullscreen {
             cairo_ctx.set_source_rgba(0.3, 0.3, 0.3, self.opacity);
             cairo_ctx.set_line_width(border_width);
@@ -210,23 +233,41 @@ impl State {
         cairo_ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
         pangocairo::functions::show_layout(&cairo_ctx, &layout);
 
-        self.wl_surface.damage_buffer(conn, 0, 0, self.width as i32, self.height as i32);
-        self.wl_surface.attach(conn, Some(buffer.into_wl_buffer()), 0, 0);
+        self.wl_surface
+            .damage_buffer(conn, 0, 0, self.width as i32, self.height as i32);
+        self.wl_surface
+            .attach(conn, Some(buffer.into_wl_buffer()), 0, 0);
         self.wl_surface.commit(conn);
     }
 }
 
 impl SeatHandler for State {
-    fn get_seats(&mut self) -> &mut Seats { &mut self.seats }
-    fn keyboard_added(&mut self, conn: &mut Connection<Self>, seat: WlSeat) { self.keyboards.push(Keyboard::new(conn, seat)); }
-    fn keyboard_removed(&mut self, _: &mut Connection<Self>, seat: WlSeat) { self.keyboards.retain(|k| k.seat() != seat); }
-    fn seat_added(&mut self, conn: &mut Connection<Self>, seat: WlSeat) { seat.get_pointer_with_cb(conn, pointer_cb); }
+    fn get_seats(&mut self) -> &mut Seats {
+        &mut self.seats
+    }
+    fn keyboard_added(&mut self, conn: &mut Connection<Self>, seat: WlSeat) {
+        self.keyboards.push(Keyboard::new(conn, seat));
+    }
+    fn keyboard_removed(&mut self, _: &mut Connection<Self>, seat: WlSeat) {
+        self.keyboards.retain(|k| k.seat() != seat);
+    }
+    fn seat_added(&mut self, conn: &mut Connection<Self>, seat: WlSeat) {
+        seat.get_pointer_with_cb(conn, pointer_cb);
+    }
 }
 
 impl KeyboardHandler for State {
-    fn get_keyboard(&mut self, wl_keyboard: WlKeyboard) -> &mut Keyboard { self.keyboards.iter_mut().find(|k| k.wl_keyboard() == wl_keyboard).unwrap() }
+    fn get_keyboard(&mut self, wl_keyboard: WlKeyboard) -> &mut Keyboard {
+        self.keyboards
+            .iter_mut()
+            .find(|k| k.wl_keyboard() == wl_keyboard)
+            .unwrap()
+    }
     fn key_presed(&mut self, conn: &mut Connection<Self>, event: KeyboardEvent) {
-        if event.keysym == xkb::Keysym::Escape { self.exit = true; conn.break_dispatch_loop(); }
+        if event.keysym == xkb::Keysym::Escape {
+            self.exit = true;
+            conn.break_dispatch_loop();
+        }
     }
     fn key_released(&mut self, _: &mut Connection<Self>, _: KeyboardEvent) {}
 }
@@ -246,7 +287,9 @@ fn layer_surface_cb(ctx: EventCtx<State, ZwlrLayerSurfaceV1>) {
             ctx.proxy.ack_configure(ctx.conn, args.serial);
             ctx.state.draw(ctx.conn);
         }
-        zwlr_layer_surface_v1::Event::Closed => { ctx.state.exit = true; }
+        zwlr_layer_surface_v1::Event::Closed => {
+            ctx.state.exit = true;
+        }
         _ => (),
     }
 }
