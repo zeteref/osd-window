@@ -28,6 +28,10 @@ struct Args {
     /// Show the box fullscreen
     #[arg(short, long)]
     fullscreen: bool,
+
+    /// Font to use for the OSD text
+    #[arg(short = 'F', long, default_value = "Sans 24")]
+    font: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -88,6 +92,7 @@ fn main() -> anyhow::Result<()> {
         target_width: args.width,
         target_height: args.height,
         markup: input.to_string(),
+        font: args.font,
         opacity: args.opacity,
         fullscreen: args.fullscreen,
         exit: false,
@@ -122,6 +127,7 @@ struct State {
     target_width: u32,  // Box width
     target_height: u32, // Box height
     markup: String,
+    font: String,
     opacity: f64,
     fullscreen: bool,
     exit: bool,
@@ -222,7 +228,7 @@ impl State {
         let pango_ctx = pangocairo::functions::create_context(&cairo_ctx);
         let layout = pango::Layout::new(&pango_ctx);
         layout.set_markup(&self.markup);
-        let font = pango::FontDescription::from_string("Sans 24");
+        let font = pango::FontDescription::from_string(&self.font);
         layout.set_font_description(Some(&font));
 
         let (text_width, text_height) = layout.pixel_size();
