@@ -12,6 +12,9 @@ use wayrs_utils::keyboard::{Keyboard, KeyboardEvent, KeyboardHandler, xkb};
 use wayrs_utils::seats::{SeatHandler, Seats};
 use wayrs_utils::shm_alloc::{BufferSpec, ShmAlloc};
 
+/// Milliseconds between auto-scroll steps while a scroll key is held.
+const SCROLL_INTERVAL_MS: i32 = 50;
+
 /// Resolved display settings: built-in defaults, overridden by the config file.
 #[derive(Debug, Clone, Copy)]
 struct Settings {
@@ -225,6 +228,7 @@ fn main() -> anyhow::Result<()> {
         line_height: 20.0,
         avail_h: 0.0,
         settings: load_settings(),
+        scroll_dir: 0,
     };
 
     while !state.exit {
@@ -234,11 +238,16 @@ fn main() -> anyhow::Result<()> {
             events: libc::POLLIN,
             revents: 0,
         }];
-        unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
-        match conn.recv_events(IoMode::NonBlocking) {
-            Ok(()) => conn.dispatch_events(&mut state),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
-            Err(e) => return Err(e.into()),
+        let timeout = if state.scroll_dir != 0 { SCROLL_INTERVAL_MS } else { -1 };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout) };
+        if ret > 0 {
+            match conn.recv_events(IoMode::NonBlocking) {
+                Ok(()) => conn.dispatch_events(&mut state),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e) => return Err(e.into()),
+            }
+        } else if ret == 0 {
+            state.scroll_tick(&mut conn);
         }
     }
 
@@ -265,6 +274,7 @@ struct State {
     line_height: f64,
     avail_h: f64,
     settings: Settings,
+    scroll_dir: i32,
 }
 
 impl State {
@@ -429,6 +439,19 @@ impl State {
             .attach(conn, Some(buffer.into_wl_buffer()), 0, 0);
         self.wl_surface.commit(conn);
     }
+
+    fn scroll_tick(&mut self, conn: &mut Connection<Self>) {
+        if self.scroll_dir == 0 {
+            return;
+        }
+        let step = self.line_height;
+        if self.scroll_dir > 0 {
+            self.scroll_y = (self.scroll_y + step).min(self.max_scroll);
+        } else {
+            self.scroll_y = (self.scroll_y - step).max(0.0);
+        }
+        self.draw(conn);
+    }
 }
 
 impl SeatHandler for State {
@@ -460,12 +483,12 @@ impl KeyboardHandler for State {
                 conn.break_dispatch_loop();
             }
             xkb::Keysym::j | xkb::Keysym::Down => {
-                self.scroll_y = (self.scroll_y + self.line_height).min(self.max_scroll);
-                self.draw(conn);
+                self.scroll_dir = 1;
+                self.scroll_tick(conn);
             }
             xkb::Keysym::k | xkb::Keysym::Up => {
-                self.scroll_y = (self.scroll_y - self.line_height).max(0.0);
-                self.draw(conn);
+                self.scroll_dir = -1;
+                self.scroll_tick(conn);
             }
             xkb::Keysym::Page_Down => {
                 self.scroll_y = (self.scroll_y + self.avail_h).min(self.max_scroll);
@@ -478,7 +501,14 @@ impl KeyboardHandler for State {
             _ => {}
         }
     }
-    fn key_released(&mut self, _: &mut Connection<Self>, _: KeyboardEvent) {}
+    fn key_released(&mut self, _: &mut Connection<Self>, event: KeyboardEvent) {
+        match event.keysym {
+            xkb::Keysym::j | xkb::Keysym::Down | xkb::Keysym::k | xkb::Keysym::Up => {
+                self.scroll_dir = 0;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn pointer_cb(ctx: EventCtx<State, WlPointer>) {
