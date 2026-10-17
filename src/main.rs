@@ -86,6 +86,42 @@ fn load_settings() -> Settings {
     settings
 }
 
+const DEFAULT_CONFIG: &str = r##"# osd-window configuration
+# All keys are optional; missing values fall back to these defaults.
+
+# Minimum font size (points) before auto-fit falls back to scrolling.
+min_font = 10
+
+# Space between the box edge and the text, in pixels.
+padding = 24
+
+# Box background colour (#RRGGBB).
+background = "#0d0d0d"
+
+# Box border colour (#RRGGBB).
+border = "#4d4d4d"
+
+# Base text colour (#RRGGBB). Markup spans can override this.
+text = "#ffffff"
+"##;
+
+fn write_default_config() -> anyhow::Result<()> {
+    let path = config_path()
+        .ok_or_else(|| anyhow::anyhow!("could not determine config path (is HOME set?)"))?;
+
+    if path.exists() {
+        anyhow::bail!("config file already exists: {}", path.display());
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, DEFAULT_CONFIG)?;
+
+    println!("Wrote default config to {}", path.display());
+    Ok(())
+}
+
 #[derive(Parser)]
 struct Args {
     /// Opacity of the window background (0.0 to 1.0)
@@ -107,10 +143,18 @@ struct Args {
     /// Font to use for the OSD text
     #[arg(short = 'F', long, default_value = "Sans 24")]
     font: String,
+
+    /// Write a default config file to the config path and exit
+    #[arg(long)]
+    write_config: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if args.write_config {
+        return write_default_config();
+    }
 
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
