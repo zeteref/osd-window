@@ -270,7 +270,10 @@ impl KeyboardHandler for State {
             .unwrap()
     }
     fn key_presed(&mut self, conn: &mut Connection<Self>, event: KeyboardEvent) {
-        if event.keysym == xkb::Keysym::Escape {
+        if event.keysym == xkb::Keysym::Escape
+            || event.keysym == xkb::Keysym::q
+            || event.keysym == xkb::Keysym::Q
+        {
             self.exit = true;
             conn.break_dispatch_loop();
         }
