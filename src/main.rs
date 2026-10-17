@@ -46,6 +46,11 @@ fn parse_color(s: &str) -> Option<(f64, f64, f64)> {
     Some((r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0))
 }
 
+/// Accept a TOML number whether it's written as an integer or a float.
+fn as_number(v: &toml::Value) -> Option<f64> {
+    v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
+}
+
 fn config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -67,10 +72,10 @@ fn load_settings() -> Settings {
         return settings;
     };
 
-    if let Some(v) = table.get("min_font").and_then(|v| v.as_float()) {
+    if let Some(v) = table.get("min_font").and_then(as_number) {
         settings.min_font = v;
     }
-    if let Some(v) = table.get("padding").and_then(|v| v.as_float()) {
+    if let Some(v) = table.get("padding").and_then(as_number) {
         settings.padding = v;
     }
     if let Some(c) = table.get("background").and_then(|v| v.as_str()).and_then(parse_color) {
