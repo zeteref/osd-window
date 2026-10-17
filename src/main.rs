@@ -12,7 +12,7 @@ use wayrs_utils::seats::{SeatHandler, Seats};
 use wayrs_utils::shm_alloc::{BufferSpec, ShmAlloc};
 
 /// Minimum font size (in points) before falling back to scrolling.
-const MIN_FONT_PT: f64 = 8.0;
+const MIN_FONT_PT: f64 = 10.0;
 
 /// Padding (in pixels) between the box edge and the text.
 const PADDING: f64 = 24.0;
