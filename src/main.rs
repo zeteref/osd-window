@@ -11,6 +11,12 @@ use wayrs_utils::keyboard::{Keyboard, KeyboardEvent, KeyboardHandler, xkb};
 use wayrs_utils::seats::{SeatHandler, Seats};
 use wayrs_utils::shm_alloc::{BufferSpec, ShmAlloc};
 
+/// Minimum font size (in points) before falling back to scrolling.
+const MIN_FONT_PT: f64 = 8.0;
+
+/// Padding (in pixels) between the box edge and the text.
+const PADDING: f64 = 24.0;
+
 #[derive(Parser)]
 struct Args {
     /// Opacity of the window background (0.0 to 1.0)
@@ -96,6 +102,10 @@ fn main() -> anyhow::Result<()> {
         opacity: args.opacity,
         fullscreen: args.fullscreen,
         exit: false,
+        scroll_y: 0.0,
+        max_scroll: 0.0,
+        line_height: 20.0,
+        avail_h: 0.0,
     };
 
     while !state.exit {
@@ -131,6 +141,10 @@ struct State {
     opacity: f64,
     fullscreen: bool,
     exit: bool,
+    scroll_y: f64,
+    max_scroll: f64,
+    line_height: f64,
+    avail_h: f64,
 }
 
 impl State {
@@ -228,16 +242,63 @@ impl State {
         let pango_ctx = pangocairo::functions::create_context(&cairo_ctx);
         let layout = pango::Layout::new(&pango_ctx);
         layout.set_markup(&self.markup);
-        let font = pango::FontDescription::from_string(&self.font);
+
+        // Wrap long lines so nothing overflows horizontally.
+        let avail_w = (box_width as f64 - 2.0 * PADDING).max(50.0);
+        let avail_h = (box_height as f64 - 2.0 * PADDING).max(50.0);
+        layout.set_width((avail_w * pango::SCALE as f64) as i32);
+
+        // Shrink the font from the configured size down to a floor until it fits.
+        let mut font = pango::FontDescription::from_string(&self.font);
+        let initial_size = font.size();
+        let floor = (MIN_FONT_PT * pango::SCALE as f64) as i32;
+        let mut size = initial_size;
+        while size > floor {
+            font.set_size(size);
+            layout.set_font_description(Some(&font));
+            let (w, h) = layout.pixel_size();
+            if (w as f64) <= avail_w && (h as f64) <= avail_h {
+                break;
+            }
+            size -= pango::SCALE;
+        }
+        font.set_size(size);
         layout.set_font_description(Some(&font));
 
         let (text_width, text_height) = layout.pixel_size();
-        cairo_ctx.move_to(
-            (box_width as f64 - text_width as f64) / 2.0,
-            (box_height as f64 - text_height as f64) / 2.0,
-        );
+
+        // Vertical placement: centered when it fits, top-aligned + scrollable otherwise.
+        let overflow = (text_height as f64) > avail_h;
+        let base_y = if overflow {
+            PADDING
+        } else {
+            (box_height as f64 - text_height as f64) / 2.0
+        };
+        self.max_scroll = if overflow {
+            (text_height as f64 - avail_h).max(0.0)
+        } else {
+            0.0
+        };
+        self.line_height = if layout.line_count() > 0 {
+            text_height as f64 / layout.line_count() as f64
+        } else {
+            20.0
+        };
+        self.avail_h = avail_h;
+        self.scroll_y = self.scroll_y.clamp(0.0, self.max_scroll);
+
+        let text_x = (box_width as f64 - text_width as f64) / 2.0;
+        let text_y = base_y - self.scroll_y;
+
+        // Clip the text to the box so scrolled content doesn't bleed outside.
+        cairo_ctx.save().unwrap();
+        cairo_ctx.new_path();
+        cairo_ctx.rectangle(0.0, 0.0, box_width as f64, box_height as f64);
+        cairo_ctx.clip();
+        cairo_ctx.move_to(text_x, text_y);
         cairo_ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
         pangocairo::functions::show_layout(&cairo_ctx, &layout);
+        cairo_ctx.restore().unwrap();
 
         self.wl_surface
             .damage_buffer(conn, 0, 0, self.width as i32, self.height as i32);
@@ -270,12 +331,28 @@ impl KeyboardHandler for State {
             .unwrap()
     }
     fn key_presed(&mut self, conn: &mut Connection<Self>, event: KeyboardEvent) {
-        if event.keysym == xkb::Keysym::Escape
-            || event.keysym == xkb::Keysym::q
-            || event.keysym == xkb::Keysym::Q
-        {
-            self.exit = true;
-            conn.break_dispatch_loop();
+        match event.keysym {
+            xkb::Keysym::Escape | xkb::Keysym::q | xkb::Keysym::Q => {
+                self.exit = true;
+                conn.break_dispatch_loop();
+            }
+            xkb::Keysym::j | xkb::Keysym::Down => {
+                self.scroll_y = (self.scroll_y + self.line_height).min(self.max_scroll);
+                self.draw(conn);
+            }
+            xkb::Keysym::k | xkb::Keysym::Up => {
+                self.scroll_y = (self.scroll_y - self.line_height).max(0.0);
+                self.draw(conn);
+            }
+            xkb::Keysym::Page_Down => {
+                self.scroll_y = (self.scroll_y + self.avail_h).min(self.max_scroll);
+                self.draw(conn);
+            }
+            xkb::Keysym::Page_Up => {
+                self.scroll_y = (self.scroll_y - self.avail_h).max(0.0);
+                self.draw(conn);
+            }
+            _ => {}
         }
     }
     fn key_released(&mut self, _: &mut Connection<Self>, _: KeyboardEvent) {}
