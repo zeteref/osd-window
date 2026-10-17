@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 
 use clap::Parser;
 use pangocairo::{cairo, pango};
@@ -11,11 +12,79 @@ use wayrs_utils::keyboard::{Keyboard, KeyboardEvent, KeyboardHandler, xkb};
 use wayrs_utils::seats::{SeatHandler, Seats};
 use wayrs_utils::shm_alloc::{BufferSpec, ShmAlloc};
 
-/// Minimum font size (in points) before falling back to scrolling.
-const MIN_FONT_PT: f64 = 10.0;
+/// Resolved display settings: built-in defaults, overridden by the config file.
+#[derive(Debug, Clone, Copy)]
+struct Settings {
+    min_font: f64,
+    padding: f64,
+    background: (f64, f64, f64),
+    border: (f64, f64, f64),
+    text: (f64, f64, f64),
+}
 
-/// Padding (in pixels) between the box edge and the text.
-const PADDING: f64 = 24.0;
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            min_font: 10.0,
+            padding: 24.0,
+            background: (0.05, 0.05, 0.05),
+            border: (0.3, 0.3, 0.3),
+            text: (1.0, 1.0, 1.0),
+        }
+    }
+}
+
+/// Parse a `#RRGGBB` colour (leading `#` optional) into 0..1 RGB floats.
+fn parse_color(s: &str) -> Option<(f64, f64, f64)> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0))
+}
+
+fn config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("osd-window").join("config.toml"))
+}
+
+/// Load settings, falling back to defaults for anything missing or invalid.
+fn load_settings() -> Settings {
+    let mut settings = Settings::default();
+
+    let Some(path) = config_path() else {
+        return settings;
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return settings;
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&contents) else {
+        return settings;
+    };
+
+    if let Some(v) = table.get("min_font").and_then(|v| v.as_float()) {
+        settings.min_font = v;
+    }
+    if let Some(v) = table.get("padding").and_then(|v| v.as_float()) {
+        settings.padding = v;
+    }
+    if let Some(c) = table.get("background").and_then(|v| v.as_str()).and_then(parse_color) {
+        settings.background = c;
+    }
+    if let Some(c) = table.get("border").and_then(|v| v.as_str()).and_then(parse_color) {
+        settings.border = c;
+    }
+    if let Some(c) = table.get("text").and_then(|v| v.as_str()).and_then(parse_color) {
+        settings.text = c;
+    }
+
+    settings
+}
 
 #[derive(Parser)]
 struct Args {
@@ -106,6 +175,7 @@ fn main() -> anyhow::Result<()> {
         max_scroll: 0.0,
         line_height: 20.0,
         avail_h: 0.0,
+        settings: load_settings(),
     };
 
     while !state.exit {
@@ -145,6 +215,7 @@ struct State {
     max_scroll: f64,
     line_height: f64,
     avail_h: f64,
+    settings: Settings,
 }
 
 impl State {
@@ -230,11 +301,13 @@ impl State {
         );
         cairo_ctx.close_path();
 
-        cairo_ctx.set_source_rgba(0.05, 0.05, 0.05, self.opacity);
+        let (r, g, b) = self.settings.background;
+        cairo_ctx.set_source_rgba(r, g, b, self.opacity);
         cairo_ctx.fill_preserve().unwrap();
 
         if !self.fullscreen {
-            cairo_ctx.set_source_rgba(0.3, 0.3, 0.3, self.opacity);
+            let (r, g, b) = self.settings.border;
+            cairo_ctx.set_source_rgba(r, g, b, self.opacity);
             cairo_ctx.set_line_width(border_width);
             cairo_ctx.stroke().unwrap();
         }
@@ -244,14 +317,14 @@ impl State {
         layout.set_markup(&self.markup);
 
         // Wrap long lines so nothing overflows horizontally.
-        let avail_w = (box_width as f64 - 2.0 * PADDING).max(50.0);
-        let avail_h = (box_height as f64 - 2.0 * PADDING).max(50.0);
+        let avail_w = (box_width as f64 - 2.0 * self.settings.padding).max(50.0);
+        let avail_h = (box_height as f64 - 2.0 * self.settings.padding).max(50.0);
         layout.set_width((avail_w * pango::SCALE as f64) as i32);
 
         // Shrink the font from the configured size down to a floor until it fits.
         let mut font = pango::FontDescription::from_string(&self.font);
         let initial_size = font.size();
-        let floor = (MIN_FONT_PT * pango::SCALE as f64) as i32;
+        let floor = (self.settings.min_font * pango::SCALE as f64) as i32;
         let mut size = initial_size;
         while size > floor {
             font.set_size(size);
@@ -270,7 +343,7 @@ impl State {
         // Vertical placement: centered when it fits, top-aligned + scrollable otherwise.
         let overflow = (text_height as f64) > avail_h;
         let base_y = if overflow {
-            PADDING
+            self.settings.padding
         } else {
             (box_height as f64 - text_height as f64) / 2.0
         };
@@ -296,7 +369,8 @@ impl State {
         cairo_ctx.rectangle(0.0, 0.0, box_width as f64, box_height as f64);
         cairo_ctx.clip();
         cairo_ctx.move_to(text_x, text_y);
-        cairo_ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        let (r, g, b) = self.settings.text;
+        cairo_ctx.set_source_rgba(r, g, b, 1.0);
         pangocairo::functions::show_layout(&cairo_ctx, &layout);
         cairo_ctx.restore().unwrap();
 

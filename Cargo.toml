@@ -11,4 +11,5 @@ wayrs-client = "1.0"
 wayrs-protocols = { version = "0.14", features = ["wlr-layer-shell-unstable-v1"] }
 wayrs-utils = { version = "0.17", features = ["shm_alloc", "seats", "keyboard"] }
 clap = { version = "4.3", features = ["derive"] }
+toml = "1"
 
