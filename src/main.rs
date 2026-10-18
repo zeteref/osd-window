@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use clap::Parser;
+use xkeysym::Keysym;
 use pangocairo::{cairo, pango};
 use wayrs_client::protocol::*;
 use wayrs_client::{Connection, EventCtx, IoMode};
@@ -15,14 +18,36 @@ use wayrs_utils::shm_alloc::{BufferSpec, ShmAlloc};
 /// Milliseconds between auto-scroll steps while a scroll key is held.
 const SCROLL_INTERVAL_MS: i32 = 50;
 
+#[derive(Debug, Clone)]
+struct KeyBindings {
+    dismiss: Vec<Keysym>,
+    scroll_up: Vec<Keysym>,
+    scroll_down: Vec<Keysym>,
+    page_up: Vec<Keysym>,
+    page_down: Vec<Keysym>,
+}
+
+impl Default for KeyBindings {
+    fn default() -> Self {
+        Self {
+            dismiss: vec![Keysym::Escape, Keysym::q, Keysym::Return],
+            scroll_up: vec![Keysym::k, Keysym::Up],
+            scroll_down: vec![Keysym::j, Keysym::Down],
+            page_up: vec![Keysym::Page_Up],
+            page_down: vec![Keysym::Page_Down],
+        }
+    }
+}
+
 /// Resolved display settings: built-in defaults, overridden by the config file.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Settings {
     min_font: f64,
     padding: f64,
     background: (f64, f64, f64),
     border: (f64, f64, f64),
     text: (f64, f64, f64),
+    keys: KeyBindings,
 }
 
 impl Default for Settings {
@@ -33,6 +58,7 @@ impl Default for Settings {
             background: (0.05, 0.05, 0.05),
             border: (0.3, 0.3, 0.3),
             text: (1.0, 1.0, 1.0),
+            keys: KeyBindings::default(),
         }
     }
 }
@@ -54,6 +80,51 @@ fn as_number(v: &toml::Value) -> Option<f64> {
     v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
 }
 
+/// Map common friendly names to canonical keysym names.
+fn normalize_key_name(name: &str) -> String {
+    let trimmed = name.trim();
+    match trimmed.to_lowercase().as_str() {
+        "esc" | "escape" => "Escape".to_string(),
+        "enter" | "return" => "Return".to_string(),
+        "space" | "spc" => "space".to_string(),
+        "up" => "Up".to_string(),
+        "down" => "Down".to_string(),
+        "left" => "Left".to_string(),
+        "right" => "Right".to_string(),
+        "pgup" | "pageup" | "page_up" | "prior" => "Page_Up".to_string(),
+        "pgdn" | "pagedown" | "page_down" | "next" => "Page_Down".to_string(),
+        "del" | "delete" => "Delete".to_string(),
+        "backspace" | "bs" => "BackSpace".to_string(),
+        "tab" => "Tab".to_string(),
+        "home" => "Home".to_string(),
+        "end" => "End".to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+/// Resolve a key name from config to a `Keysym`, or `None` if unknown.
+///
+/// Tries an exact match first, then falls back to a case-insensitive lookup so
+/// friendly names like `home` resolve to `Home`.
+fn resolve_keysym(name: &str) -> Option<Keysym> {
+    let canonical = normalize_key_name(name);
+    let mut keysym = xkb::keysym_from_name(&canonical, xkb::KEYSYM_NO_FLAGS);
+    if keysym == Keysym::NoSymbol {
+        keysym = xkb::keysym_from_name(&canonical, xkb::KEYSYM_CASE_INSENSITIVE);
+    }
+    (keysym != Keysym::NoSymbol).then_some(keysym)
+}
+
+/// Human-friendly keysym name for `--get-key` output and error messages.
+fn keysym_display_name(keysym: Keysym) -> String {
+    match xkb::keysym_get_name(keysym).as_str() {
+        "" => format!("0x{:x}", keysym.raw()),
+        "Prior" => "Page_Up".to_string(),
+        "Next" => "Page_Down".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -61,19 +132,24 @@ fn config_path() -> Option<PathBuf> {
     Some(base.join("osd-window").join("config.toml"))
 }
 
-/// Load settings, falling back to defaults for anything missing or invalid.
-fn load_settings() -> Settings {
+
+
+/// Hard error on malformed config (instead of silent fallback).
+fn load_settings() -> anyhow::Result<Settings> {
     let mut settings = Settings::default();
 
     let Some(path) = config_path() else {
-        return settings;
+        return Ok(settings);
     };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return settings;
-    };
-    let Ok(table) = toml::from_str::<toml::Table>(&contents) else {
-        return settings;
-    };
+    if !path.exists() {
+        return Ok(settings);
+    }
+
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read config {}", path.display()))?;
+
+    let table: toml::Table = toml::from_str(&contents)
+        .with_context(|| format!("invalid TOML in {}", path.display()))?;
 
     if let Some(v) = table.get("min_font").and_then(as_number) {
         settings.min_font = v;
@@ -91,11 +167,96 @@ fn load_settings() -> Settings {
         settings.text = c;
     }
 
-    settings
+    if let Some(keys_table) = table.get("keys").and_then(|v| v.as_table()) {
+        settings.keys = parse_key_bindings(&path, keys_table)?;
+    }
+
+    Ok(settings)
+}
+
+/// Resolve one action's key list, falling back to `default` when not present.
+fn load_key_list(
+    path: &Path,
+    keys_table: &toml::Table,
+    action: &str,
+    default: &[Keysym],
+) -> anyhow::Result<Vec<Keysym>> {
+    let Some(value) = keys_table.get(action) else {
+        return Ok(default.to_vec());
+    };
+
+    let arr = value.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "[keys].{} in {} must be an array of key names",
+            action,
+            path.display()
+        )
+    })?;
+
+    let mut resolved = Vec::with_capacity(arr.len());
+    for item in arr {
+        let name = item.as_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "[keys].{} in {} must contain only strings",
+                action,
+                path.display()
+            )
+        })?;
+        let keysym = resolve_keysym(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown key name '{}' in [keys].{} of {} \
+                 (run `osd-window --get-key` to discover valid names)",
+                name,
+                action,
+                path.display()
+            )
+        })?;
+        resolved.push(keysym);
+    }
+    Ok(resolved)
+}
+
+/// Parse the `[keys]` table and reject duplicate key assignments.
+fn parse_key_bindings(path: &Path, keys_table: &toml::Table) -> anyhow::Result<KeyBindings> {
+    let defaults = KeyBindings::default();
+    let keys = KeyBindings {
+        dismiss: load_key_list(path, keys_table, "dismiss", &defaults.dismiss)?,
+        scroll_up: load_key_list(path, keys_table, "scroll_up", &defaults.scroll_up)?,
+        scroll_down: load_key_list(path, keys_table, "scroll_down", &defaults.scroll_down)?,
+        page_up: load_key_list(path, keys_table, "page_up", &defaults.page_up)?,
+        page_down: load_key_list(path, keys_table, "page_down", &defaults.page_down)?,
+    };
+
+    validate_key_bindings(&keys)?;
+    Ok(keys)
+}
+
+/// Reject any keysym bound to more than one action.
+fn validate_key_bindings(keys: &KeyBindings) -> anyhow::Result<()> {
+    let mut seen: HashMap<Keysym, &'static str> = HashMap::new();
+    for (action, list) in [
+        ("dismiss", keys.dismiss.as_slice()),
+        ("scroll_up", keys.scroll_up.as_slice()),
+        ("scroll_down", keys.scroll_down.as_slice()),
+        ("page_up", keys.page_up.as_slice()),
+        ("page_down", keys.page_down.as_slice()),
+    ] {
+        for &keysym in list {
+            if let Some(previous) = seen.insert(keysym, action) {
+                anyhow::bail!(
+                    "key '{}' is assigned to multiple actions ({} and {})",
+                    keysym_display_name(keysym),
+                    previous,
+                    action
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 const DEFAULT_CONFIG: &str = r##"# osd-window configuration
-# All keys are optional; missing values fall back to these defaults.
+# Every value is optional; anything you omit falls back to the built-in default.
 
 # Minimum font size (points) before auto-fit falls back to scrolling.
 min_font = 10
@@ -111,6 +272,23 @@ border = "#4d4d4d"
 
 # Base text colour (#RRGGBB). Markup spans can override this.
 text = "#ffffff"
+
+# Keybindings. Each action takes a list of one or more key names.
+#
+# Key names are XKB keysym names; run `osd-window --get-key`, press a key, and
+# it prints the exact name to use here. A few friendly aliases also work:
+#   esc/escape, enter/return, space, up/down/left/right,
+#   pgup/pgdn/page_up/page_down, del/delete, backspace, tab, home, end.
+# Names are case-insensitive.
+#
+# A key may only be bound to one action: using the same key in two actions is
+# an error. If you override one action, the rest keep their defaults below.
+[keys]
+dismiss     = ["Escape", "q", "Return"]
+scroll_up   = ["k", "Up"]
+scroll_down = ["j", "Down"]
+page_up     = ["Page_Up"]
+page_down   = ["Page_Down"]
 "##;
 
 fn write_default_config() -> anyhow::Result<()> {
@@ -155,6 +333,10 @@ struct Args {
     /// Write a default config file to the config path and exit
     #[arg(long)]
     write_config: bool,
+
+    /// Wait for a keypress and print the key name to use in config, then exit
+    #[arg(long)]
+    get_key: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -164,9 +346,14 @@ fn main() -> anyhow::Result<()> {
         return write_default_config();
     }
 
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
-    let input = input.trim();
+    // In --get-key mode we show a hint instead of reading stdin for OSD text.
+    let markup = if args.get_key {
+        "Press any key…".to_string()
+    } else {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        input.trim().to_string()
+    };
 
     let mut conn = Connection::connect()?;
     conn.blocking_roundtrip()?;
@@ -208,6 +395,8 @@ fn main() -> anyhow::Result<()> {
 
     wl_surface.commit(&mut conn);
 
+    let settings = load_settings()?;
+
     let mut state = State {
         shm_alloc,
         seats,
@@ -218,7 +407,7 @@ fn main() -> anyhow::Result<()> {
         height: 0, // Will be set by Configure event
         target_width: args.width,
         target_height: args.height,
-        markup: input.to_string(),
+        markup,
         font: args.font,
         opacity: args.opacity,
         fullscreen: args.fullscreen,
@@ -227,7 +416,8 @@ fn main() -> anyhow::Result<()> {
         max_scroll: 0.0,
         line_height: 20.0,
         avail_h: 0.0,
-        settings: load_settings(),
+        settings,
+        get_key_mode: args.get_key,
         scroll_dir: 0,
     };
 
@@ -274,6 +464,7 @@ struct State {
     line_height: f64,
     avail_h: f64,
     settings: Settings,
+    get_key_mode: bool,
     scroll_dir: i32,
 }
 
@@ -477,36 +668,41 @@ impl KeyboardHandler for State {
             .unwrap()
     }
     fn key_presed(&mut self, conn: &mut Connection<Self>, event: KeyboardEvent) {
-        match event.keysym {
-            xkb::Keysym::Escape | xkb::Keysym::q | xkb::Keysym::Q => {
-                self.exit = true;
-                conn.break_dispatch_loop();
-            }
-            xkb::Keysym::j | xkb::Keysym::Down => {
-                self.scroll_dir = 1;
-                self.scroll_tick(conn);
-            }
-            xkb::Keysym::k | xkb::Keysym::Up => {
-                self.scroll_dir = -1;
-                self.scroll_tick(conn);
-            }
-            xkb::Keysym::Page_Down => {
-                self.scroll_y = (self.scroll_y + self.avail_h).min(self.max_scroll);
-                self.draw(conn);
-            }
-            xkb::Keysym::Page_Up => {
-                self.scroll_y = (self.scroll_y - self.avail_h).max(0.0);
-                self.draw(conn);
-            }
-            _ => {}
+        if self.get_key_mode {
+            let name = keysym_display_name(event.keysym);
+            println!("{}", if name.is_empty() { "(no keysym)" } else { &name });
+            self.exit = true;
+            conn.break_dispatch_loop();
+            return;
+        }
+
+        let keysym = event.keysym;
+        let keys = &self.settings.keys;
+        if keys.dismiss.contains(&keysym) {
+            self.exit = true;
+            conn.break_dispatch_loop();
+        } else if keys.scroll_down.contains(&keysym) {
+            self.scroll_dir = 1;
+            self.scroll_tick(conn);
+        } else if keys.scroll_up.contains(&keysym) {
+            self.scroll_dir = -1;
+            self.scroll_tick(conn);
+        } else if keys.page_down.contains(&keysym) {
+            self.scroll_y = (self.scroll_y + self.avail_h).min(self.max_scroll);
+            self.draw(conn);
+        } else if keys.page_up.contains(&keysym) {
+            self.scroll_y = (self.scroll_y - self.avail_h).max(0.0);
+            self.draw(conn);
         }
     }
     fn key_released(&mut self, _: &mut Connection<Self>, event: KeyboardEvent) {
-        match event.keysym {
-            xkb::Keysym::j | xkb::Keysym::Down | xkb::Keysym::k | xkb::Keysym::Up => {
-                self.scroll_dir = 0;
-            }
-            _ => {}
+        if self.get_key_mode {
+            return;
+        }
+        let keysym = event.keysym;
+        let keys = &self.settings.keys;
+        if keys.scroll_down.contains(&keysym) || keys.scroll_up.contains(&keysym) {
+            self.scroll_dir = 0;
         }
     }
 }
@@ -530,5 +726,81 @@ fn layer_surface_cb(ctx: EventCtx<State, ZwlrLayerSurfaceV1>) {
             ctx.state.exit = true;
         }
         _ => (),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_aliases_and_names() {
+        assert_eq!(resolve_keysym("esc"), Some(Keysym::Escape));
+        assert_eq!(resolve_keysym("ESCAPE"), Some(Keysym::Escape));
+        assert_eq!(resolve_keysym("enter"), Some(Keysym::Return));
+        assert_eq!(resolve_keysym("return"), Some(Keysym::Return));
+        assert_eq!(resolve_keysym("q"), Some(Keysym::q));
+        assert_eq!(resolve_keysym("j"), Some(Keysym::j));
+        assert_eq!(resolve_keysym("space"), Some(Keysym::space));
+        assert_eq!(resolve_keysym("pgup"), Some(Keysym::Page_Up));
+        assert_eq!(resolve_keysym("page_down"), Some(Keysym::Page_Down));
+        assert_eq!(resolve_keysym("home"), Some(Keysym::Home));
+        assert_eq!(resolve_keysym("BackSpace"), Some(Keysym::BackSpace));
+        // Unknown names resolve to None.
+        assert_eq!(resolve_keysym("escaoe"), None);
+        assert_eq!(resolve_keysym("bogus"), None);
+    }
+
+    #[test]
+    fn display_name_normalizes_legacy_names() {
+        assert_eq!(keysym_display_name(Keysym::Page_Up), "Page_Up");
+        assert_eq!(keysym_display_name(Keysym::Page_Down), "Page_Down");
+        assert_eq!(keysym_display_name(Keysym::Escape), "Escape");
+        assert_eq!(keysym_display_name(Keysym::q), "q");
+    }
+
+    #[test]
+    fn default_bindings_have_no_duplicates() {
+        assert!(validate_key_bindings(&KeyBindings::default()).is_ok());
+    }
+
+    fn parse(keys_toml: &str) -> anyhow::Result<KeyBindings> {
+        let table: toml::Table = toml::from_str(keys_toml).unwrap();
+        parse_key_bindings(Path::new("test.toml"), &table)
+    }
+
+    #[test]
+    fn parse_valid_bindings() {
+        let keys = parse(r#"dismiss = ["esc", "q", "Return"]"#).unwrap();
+        assert_eq!(keys.dismiss, vec![Keysym::Escape, Keysym::q, Keysym::Return]);
+        // Unspecified actions keep defaults.
+        assert_eq!(keys.scroll_down, KeyBindings::default().scroll_down);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_key() {
+        let err = parse(r#"dismiss = ["escaoe"]"#).unwrap_err();
+        assert!(err.to_string().contains("unknown key name 'escaoe'"));
+        assert!(err.to_string().contains("--get-key"));
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_key() {
+        let err = parse(r#"dismiss = ["j"]"#).unwrap_err();
+        assert!(err.to_string().contains("multiple actions"));
+        assert!(err.to_string().contains("dismiss"));
+        assert!(err.to_string().contains("scroll_down"));
+    }
+
+    #[test]
+    fn parse_rejects_non_string() {
+        let err = parse(r#"dismiss = [1, 2]"#).unwrap_err();
+        assert!(err.to_string().contains("only strings"));
+    }
+
+    #[test]
+    fn parse_rejects_non_array() {
+        let err = parse(r#"dismiss = "q""#).unwrap_err();
+        assert!(err.to_string().contains("array"));
     }
 }
