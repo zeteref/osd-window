@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::{self, Read};
-use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -352,55 +351,6 @@ struct Args {
     /// Wait for a keypress and print the key name to use in config, then exit
     #[arg(long)]
     get_key: bool,
-
-    /// Auto-dismiss when kanata leaves this layer (watches kanata's TCP LayerChange)
-    #[arg(long, value_name = "LAYER")]
-    layer: Option<String>,
-
-    /// kanata TCP port to watch for layer changes (used with --layer)
-    #[arg(long, value_name = "PORT")]
-    kanata_port: Option<String>,
-}
-
-/// Drain available bytes from the kanata TCP stream and return `true` if a
-/// `LayerChange` to a layer other than `layer` was observed.
-///
-/// The first `LayerChange` is kanata's initial greeting (the layer at connect
-/// time) and is ignored so a connect that lands mid-transition never causes a
-/// spurious dismiss.
-fn poll_kanata(stream: &mut TcpStream, buf: &mut Vec<u8>, layer: &str, greeted: &mut bool) -> bool {
-    let mut chunk = [0u8; 4096];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => return false, // EOF / kanata closed the connection
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = buf.drain(..=pos).collect();
-                    let line = String::from_utf8_lossy(&line);
-                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-                        continue;
-                    };
-                    let Some(new) = v
-                        .get("LayerChange")
-                        .and_then(|l| l.get("new"))
-                        .and_then(|n| n.as_str())
-                    else {
-                        continue;
-                    };
-                    if !*greeted {
-                        *greeted = true;
-                        continue;
-                    }
-                    if new != layer {
-                        return true;
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return false,
-            Err(_) => return false,
-        }
-    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -485,69 +435,20 @@ fn main() -> anyhow::Result<()> {
         scroll_dir: 0,
     };
 
-    // kanata layer-change watcher for auto-dismiss (only when --layer is given).
-    let tcp: Option<(TcpStream, String)> = match args.layer {
-        Some(layer) => {
-            let port = args
-                .kanata_port
-                .or_else(|| std::env::var("KANATA_PORT").ok())
-                .unwrap_or_else(|| "5829".to_string());
-            match TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap_or(5829))) {
-                Ok(stream) => {
-                    stream.set_nonblocking(true)?;
-                    Some((stream, layer))
-                }
-                Err(e) => {
-                    eprintln!(
-                        "osd-window: kanata TCP port {port} unreachable ({e}); auto-dismiss disabled"
-                    );
-                    None
-                }
-            }
-        }
-        None => None,
-    };
-    let mut tcp = tcp;
-    let mut tcp_buf: Vec<u8> = Vec::new();
-    let mut tcp_greeted = false;
-
     while !state.exit {
         conn.flush(IoMode::Blocking)?;
-
-        let mut fds = vec![libc::pollfd {
+        let mut fds = [libc::pollfd {
             fd: conn.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         }];
-        let tcp_idx = if let Some((stream, _)) = &tcp {
-            fds.push(libc::pollfd {
-                fd: stream.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            Some(fds.len() - 1)
-        } else {
-            None
-        };
-
         let timeout = if state.scroll_dir != 0 { SCROLL_INTERVAL_MS } else { -1 };
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout) };
         if ret > 0 {
-            if fds[0].revents & libc::POLLIN != 0 {
-                match conn.recv_events(IoMode::NonBlocking) {
-                    Ok(()) => conn.dispatch_events(&mut state),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            if let Some(idx) = tcp_idx {
-                if fds[idx].revents & libc::POLLIN != 0 {
-                    if let Some((stream, layer)) = tcp.as_mut() {
-                        if poll_kanata(stream, &mut tcp_buf, layer, &mut tcp_greeted) {
-                            state.exit = true;
-                        }
-                    }
-                }
+            match conn.recv_events(IoMode::NonBlocking) {
+                Ok(()) => conn.dispatch_events(&mut state),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+                Err(e) => return Err(e.into()),
             }
         } else if ret == 0 {
             state.scroll_tick(&mut conn);
