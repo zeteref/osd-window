@@ -135,15 +135,22 @@ fn config_path() -> Option<PathBuf> {
 
 
 /// Hard error on malformed config (instead of silent fallback).
-fn load_settings() -> anyhow::Result<Settings> {
+///
+/// When `config` is provided, that file must exist (a missing explicitly
+/// requested file is an error). Otherwise the default config path is used,
+/// where a missing file simply means "use defaults".
+fn load_settings(config: Option<&Path>) -> anyhow::Result<Settings> {
     let mut settings = Settings::default();
 
-    let Some(path) = config_path() else {
-        return Ok(settings);
+    let path = if let Some(explicit) = config {
+        anyhow::ensure!(explicit.exists(), "config file not found: {}", explicit.display());
+        explicit.to_path_buf()
+    } else {
+        match config_path() {
+            Some(p) if p.exists() => p,
+            _ => return Ok(settings),
+        }
     };
-    if !path.exists() {
-        return Ok(settings);
-    }
 
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
@@ -291,9 +298,12 @@ page_up     = ["Page_Up"]
 page_down   = ["Page_Down"]
 "##;
 
-fn write_default_config() -> anyhow::Result<()> {
-    let path = config_path()
-        .ok_or_else(|| anyhow::anyhow!("could not determine config path (is HOME set?)"))?;
+fn write_default_config(config: Option<&Path>) -> anyhow::Result<()> {
+    let path = match config {
+        Some(explicit) => explicit.to_path_buf(),
+        None => config_path()
+            .ok_or_else(|| anyhow::anyhow!("could not determine config path (is HOME set?)"))?,
+    };
 
     if path.exists() {
         anyhow::bail!("config file already exists: {}", path.display());
@@ -330,6 +340,10 @@ struct Args {
     #[arg(short = 'F', long, default_value = "Sans 24")]
     font: String,
 
+    /// Use an alternate config file instead of the default path
+    #[arg(short = 'c', long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
     /// Write a default config file to the config path and exit
     #[arg(long)]
     write_config: bool,
@@ -343,7 +357,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     if args.write_config {
-        return write_default_config();
+        return write_default_config(args.config.as_deref());
     }
 
     // In --get-key mode we show a hint instead of reading stdin for OSD text.
@@ -395,7 +409,7 @@ fn main() -> anyhow::Result<()> {
 
     wl_surface.commit(&mut conn);
 
-    let settings = load_settings()?;
+    let settings = load_settings(args.config.as_deref())?;
 
     let mut state = State {
         shm_alloc,
@@ -802,5 +816,37 @@ mod tests {
     fn parse_rejects_non_array() {
         let err = parse(r#"dismiss = "q""#).unwrap_err();
         assert!(err.to_string().contains("array"));
+    }
+
+    #[test]
+    fn load_settings_rejects_missing_explicit_config() {
+        let err = load_settings(Some(Path::new("/nonexistent/osd-window-test.toml"))).unwrap_err();
+        assert!(err.to_string().contains("config file not found"));
+    }
+
+    #[test]
+    fn load_settings_reads_explicit_config() {
+        let path = std::env::temp_dir().join(format!("osd-window-test-{}.toml", std::process::id()));
+        std::fs::write(&path, "min_font = 42\n").unwrap();
+
+        let settings = load_settings(Some(&path)).unwrap();
+        assert_eq!(settings.min_font, 42.0);
+        // Keybindings fall back to defaults when not present in the file.
+        assert_eq!(settings.keys.dismiss, KeyBindings::default().dismiss);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_default_config_to_explicit_path() {
+        let path = std::env::temp_dir()
+            .join(format!("osd-window-write-test-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        write_default_config(Some(&path)).unwrap();
+        assert!(path.exists());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[keys]"));
+
+        std::fs::remove_file(&path).ok();
     }
 }
