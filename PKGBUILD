@@ -9,6 +9,7 @@ url="https://github.com/zeteref/osd-window"
 license=('MIT')
 depends=('cairo' 'glib2' 'libxkbcommon' 'pango')
 makedepends=('rust' 'pkgconf' 'cairo' 'glib2' 'libxkbcommon' 'pango')
+options=('!debug')
 source=("$pkgname::git+https://github.com/zeteref/osd-window.git#tag=v$pkgver")
 sha256sums=('SKIP')
 
