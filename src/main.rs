@@ -39,6 +39,24 @@ impl Default for KeyBindings {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CommandBinding {
+    keys: Vec<Keysym>,
+    command: String,
+    dismiss: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Commands {
+    bindings: Vec<CommandBinding>,
+}
+
+impl Default for Commands {
+    fn default() -> Self {
+        Self { bindings: vec![] }
+    }
+}
+
 /// Resolved display settings: built-in defaults, overridden by the config file.
 #[derive(Debug, Clone)]
 struct Settings {
@@ -48,6 +66,7 @@ struct Settings {
     border: (f64, f64, f64),
     text: (f64, f64, f64),
     keys: KeyBindings,
+    commands: Commands,
 }
 
 impl Default for Settings {
@@ -59,6 +78,7 @@ impl Default for Settings {
             border: (0.3, 0.3, 0.3),
             text: (1.0, 1.0, 1.0),
             keys: KeyBindings::default(),
+            commands: Commands::default(),
         }
     }
 }
@@ -178,6 +198,12 @@ fn load_settings(config: Option<&Path>) -> anyhow::Result<Settings> {
         settings.keys = parse_key_bindings(&path, keys_table)?;
     }
 
+    if let Some(commands_table) = table.get("commands").and_then(|v| v.as_table()) {
+        settings.commands.bindings = parse_commands(&path, commands_table)?;
+    }
+
+    validate_command_bindings(&settings)?;
+
     Ok(settings)
 }
 
@@ -262,6 +288,114 @@ fn validate_key_bindings(keys: &KeyBindings) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse the `[commands.*]` table into `CommandBinding`s.
+fn parse_commands(path: &Path, commands_table: &toml::Table) -> anyhow::Result<Vec<CommandBinding>> {
+    let mut bindings = Vec::new();
+    for (name, value) in commands_table {
+        let table = value.as_table().ok_or_else(|| {
+            anyhow::anyhow!("[commands].{} in {} must be a table", name, path.display())
+        })?;
+
+        let command = table
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "[commands].{} in {} is missing a 'command' string",
+                    name,
+                    path.display()
+                )
+            })?
+            .to_string();
+
+        let keys = load_command_keys(path, name, table)?;
+
+        let dismiss = table
+            .get("dismiss")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        bindings.push(CommandBinding {
+            keys,
+            command,
+            dismiss,
+        });
+    }
+    Ok(bindings)
+}
+
+/// Resolve the `keys` array of a `[commands.*]` entry (required, no default).
+fn load_command_keys(path: &Path, name: &str, table: &toml::Table) -> anyhow::Result<Vec<Keysym>> {
+    let value = table.get("keys").ok_or_else(|| {
+        anyhow::anyhow!(
+            "[commands].{} in {} is missing a 'keys' array",
+            name,
+            path.display()
+        )
+    })?;
+
+    let arr = value.as_array().ok_or_else(|| {
+        anyhow::anyhow!(
+            "[commands].{}.keys in {} must be an array of key names",
+            name,
+            path.display()
+        )
+    })?;
+
+    let mut resolved = Vec::with_capacity(arr.len());
+    for item in arr {
+        let key_name = item.as_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "[commands].{}.keys in {} must contain only strings",
+                name,
+                path.display()
+            )
+        })?;
+        let keysym = resolve_keysym(key_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown key name '{}' in [commands].{} of {} \
+                 (run `osd-window --get-key` to discover valid names)",
+                key_name,
+                name,
+                path.display()
+            )
+        })?;
+        resolved.push(keysym);
+    }
+    Ok(resolved)
+}
+
+/// Reject any key bound to both a built-in action and a command binding, or to
+/// more than one command binding.
+fn validate_command_bindings(settings: &Settings) -> anyhow::Result<()> {
+    let keys = &settings.keys;
+    let mut seen: HashMap<Keysym, String> = HashMap::new();
+    for (action, list) in [
+        ("dismiss", keys.dismiss.as_slice()),
+        ("scroll_up", keys.scroll_up.as_slice()),
+        ("scroll_down", keys.scroll_down.as_slice()),
+        ("page_up", keys.page_up.as_slice()),
+        ("page_down", keys.page_down.as_slice()),
+    ] {
+        for &keysym in list {
+            seen.insert(keysym, action.to_string());
+        }
+    }
+
+    for binding in &settings.commands.bindings {
+        for &keysym in &binding.keys {
+            if let Some(previous) = seen.insert(keysym, "a command binding".to_string()) {
+                anyhow::bail!(
+                    "key '{}' is assigned to multiple actions ({} and a command binding)",
+                    keysym_display_name(keysym),
+                    previous
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 const DEFAULT_CONFIG: &str = r##"# osd-window configuration
 # Every value is optional; anything you omit falls back to the built-in default.
 
@@ -319,6 +453,7 @@ fn write_default_config(config: Option<&Path>) -> anyhow::Result<()> {
 }
 
 #[derive(Parser)]
+#[command(version = env!("CARGO_PKG_VERSION"), about, long_about = None)]
 struct Args {
     /// Opacity of the window background (0.0 to 1.0)
     #[arg(short, long, default_value_t = 0.95)]
@@ -351,6 +486,22 @@ struct Args {
     /// Wait for a keypress and print the key name to use in config, then exit
     #[arg(long)]
     get_key: bool,
+
+    /// Original (source) text, substituted for {original} in command bindings
+    #[arg(long, default_value = "")]
+    original: String,
+
+    /// Translated text, substituted for {translation} and {text}
+    #[arg(long, default_value = "")]
+    translation: String,
+
+    /// Source language code, substituted for {from}
+    #[arg(long = "from", default_value = "")]
+    from_lang: String,
+
+    /// Target language code, substituted for {to}
+    #[arg(long = "to", default_value = "")]
+    to_lang: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -421,7 +572,11 @@ fn main() -> anyhow::Result<()> {
         height: 0, // Will be set by Configure event
         target_width: args.width,
         target_height: args.height,
-        markup,
+        markup: markup.clone(),
+        original: args.original,
+        translation: args.translation,
+        from_lang: args.from_lang,
+        to_lang: args.to_lang,
         font: args.font,
         opacity: args.opacity,
         fullscreen: args.fullscreen,
@@ -469,6 +624,10 @@ struct State {
     target_width: u32,  // Box width
     target_height: u32, // Box height
     markup: String,
+    original: String,
+    translation: String,
+    from_lang: String,
+    to_lang: String,
     font: String,
     opacity: f64,
     fullscreen: bool,
@@ -480,6 +639,12 @@ struct State {
     settings: Settings,
     get_key_mode: bool,
     scroll_dir: i32,
+}
+
+/// Quote a string for safe use inside `sh -c`. Single-quotes the value and
+/// escapes any embedded single quotes with the standard `'\''` sequence.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 impl State {
@@ -657,6 +822,29 @@ impl State {
         }
         self.draw(conn);
     }
+
+    fn run_command(&mut self, command_template: &str, should_dismiss: bool, conn: &mut Connection<Self>) {
+        let command = command_template
+            .replace("{original}", &shell_quote(&self.original))
+            .replace("{translation}", &shell_quote(&self.translation))
+            .replace("{text}", &shell_quote(&self.translation))
+            .replace("{from}", &shell_quote(&self.from_lang))
+            .replace("{to}", &shell_quote(&self.to_lang));
+
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("OSD_ORIGINAL", &self.original)
+            .env("OSD_TRANSLATION", &self.translation)
+            .env("OSD_FROM", &self.from_lang)
+            .env("OSD_TO", &self.to_lang)
+            .spawn();
+
+        if should_dismiss {
+            self.exit = true;
+            conn.break_dispatch_loop();
+        }
+    }
 }
 
 impl SeatHandler for State {
@@ -691,6 +879,17 @@ impl KeyboardHandler for State {
         }
 
         let keysym = event.keysym;
+
+        // Resolve any configured command binding that matches this key. We clone
+        // the template so no borrow of `self.settings` is held across `&mut self`.
+        let matched = self
+            .settings
+            .commands
+            .bindings
+            .iter()
+            .find(|b| b.keys.contains(&keysym))
+            .map(|b| (b.command.clone(), b.dismiss));
+
         let keys = &self.settings.keys;
         if keys.dismiss.contains(&keysym) {
             self.exit = true;
@@ -707,6 +906,8 @@ impl KeyboardHandler for State {
         } else if keys.page_up.contains(&keysym) {
             self.scroll_y = (self.scroll_y - self.avail_h).max(0.0);
             self.draw(conn);
+        } else if let Some((command, dismiss)) = matched {
+            self.run_command(&command, dismiss, conn);
         }
     }
     fn key_released(&mut self, _: &mut Connection<Self>, event: KeyboardEvent) {
@@ -846,6 +1047,40 @@ mod tests {
         write_default_config(Some(&path)).unwrap();
         assert!(path.exists());
         assert!(std::fs::read_to_string(&path).unwrap().contains("[keys]"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_settings_reads_commands() {
+        let path = std::env::temp_dir().join(format!("osd-window-cmd-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "[commands.speak]\nkeys = [\"s\"]\ncommand = \"espeak -v {to} {translation}\"\ndismiss = false\n",
+        )
+        .unwrap();
+
+        let settings = load_settings(Some(&path)).unwrap();
+        assert_eq!(settings.commands.bindings.len(), 1);
+        assert_eq!(settings.commands.bindings[0].keys, vec![Keysym::s]);
+        assert_eq!(settings.commands.bindings[0].dismiss, false);
+        assert!(settings.commands.bindings[0].command.contains("{translation}"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn commands_reject_duplicate_key_with_builtin() {
+        let path = std::env::temp_dir().join(format!("osd-window-dup-{}.toml", std::process::id()));
+        // `q` is already bound to `dismiss`.
+        std::fs::write(
+            &path,
+            "[commands.speak]\nkeys = [\"q\"]\ncommand = \"espeak hi\"\n",
+        )
+        .unwrap();
+
+        let err = load_settings(Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("multiple actions"));
 
         std::fs::remove_file(&path).ok();
     }
