@@ -19,4 +19,4 @@ bump type="patch":
 # bump and commit (staging is up to you)
 release type="patch":
     just bump {{type}}
-    git commit -v
+    git commit -v .

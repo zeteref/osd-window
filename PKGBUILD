@@ -1,7 +1,7 @@
 # Maintainer: zeteref <zeteref@gmail.com>
 
 pkgname=osd-window
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Wayland OSD overlay that displays text piped on stdin"
 arch=('x86_64')
