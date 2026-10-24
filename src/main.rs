@@ -487,21 +487,9 @@ struct Args {
     #[arg(long)]
     get_key: bool,
 
-    /// Original (source) text, substituted for {original} in command bindings
-    #[arg(long, default_value = "")]
-    original: String,
-
-    /// Translated text, substituted for {translation} and {text}
-    #[arg(long, default_value = "")]
-    translation: String,
-
-    /// Source language code, substituted for {from}
-    #[arg(long = "from", default_value = "")]
-    from_lang: String,
-
-    /// Target language code, substituted for {to}
-    #[arg(long = "to", default_value = "")]
-    to_lang: String,
+    /// Extra KEY=VALUE pairs made available to command bindings as {KEY}
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    vars: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -562,6 +550,15 @@ fn main() -> anyhow::Result<()> {
 
     let settings = load_settings(args.config.as_deref())?;
 
+    // Parse --var KEY=VALUE pairs for use as {KEY} placeholders in commands.
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for var in &args.vars {
+        match var.split_once('=') {
+            Some((k, v)) => vars.push((k.to_string(), v.to_string())),
+            None => anyhow::bail!("invalid --var '{}' (expected KEY=VALUE)", var),
+        }
+    }
+
     let mut state = State {
         shm_alloc,
         seats,
@@ -573,10 +570,7 @@ fn main() -> anyhow::Result<()> {
         target_width: args.width,
         target_height: args.height,
         markup: markup.clone(),
-        original: args.original,
-        translation: args.translation,
-        from_lang: args.from_lang,
-        to_lang: args.to_lang,
+        vars,
         font: args.font,
         opacity: args.opacity,
         fullscreen: args.fullscreen,
@@ -624,10 +618,7 @@ struct State {
     target_width: u32,  // Box width
     target_height: u32, // Box height
     markup: String,
-    original: String,
-    translation: String,
-    from_lang: String,
-    to_lang: String,
+    vars: Vec<(String, String)>,
     font: String,
     opacity: f64,
     fullscreen: bool,
@@ -824,21 +815,19 @@ impl State {
     }
 
     fn run_command(&mut self, command_template: &str, should_dismiss: bool, conn: &mut Connection<Self>) {
-        let command = command_template
-            .replace("{original}", &shell_quote(&self.original))
-            .replace("{translation}", &shell_quote(&self.translation))
-            .replace("{text}", &shell_quote(&self.translation))
-            .replace("{from}", &shell_quote(&self.from_lang))
-            .replace("{to}", &shell_quote(&self.to_lang));
+        let mut command = command_template
+            .replace("{text}", &shell_quote(&self.markup));
+        for (key, value) in &self.vars {
+            command = command.replace(&format!("{{{}}}", key), &shell_quote(value));
+        }
 
-        let _ = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .env("OSD_ORIGINAL", &self.original)
-            .env("OSD_TRANSLATION", &self.translation)
-            .env("OSD_FROM", &self.from_lang)
-            .env("OSD_TO", &self.to_lang)
-            .spawn();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(command).env("OSD_TEXT", &self.markup);
+        for (key, value) in &self.vars {
+            cmd.env(format!("OSD_{}", key.to_uppercase()), value);
+        }
+
+        let _ = cmd.spawn();
 
         if should_dismiss {
             self.exit = true;
