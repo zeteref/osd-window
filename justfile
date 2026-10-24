@@ -16,7 +16,12 @@ bump type="patch":
     ' PKGBUILD > PKGBUILD.tmp && mv PKGBUILD.tmp PKGBUILD
     grep -m1 '^pkgver=' PKGBUILD
 
-# bump and commit (staging is up to you)
+# bump and commit interactively (opens $EDITOR) — for humans
 release type="patch":
     just bump {{type}}
     git commit -v .
+
+# bump and commit with a message (non-interactive) — for LLM agents / scripts
+release-msg msg type="patch":
+    just bump {{type}}
+    git commit -m "{{msg}}" .
